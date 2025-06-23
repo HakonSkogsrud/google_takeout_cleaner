@@ -211,4 +211,41 @@ find "$TARGET_DIR" -type f -not -iname '*.json' -print0 | while IFS= read -r -d 
 
 done
 
+# ==============================================================================
+# PHASE 3: WRITE METADATA FROM JSON TO MEDIA FILES
+# This is a destructive operation (-overwrite_original).
+# It will only run if DRY_RUN is set to false.
+# ==============================================================================
+log "--- Phase 3: Writing metadata from JSON files into media files ---"
+
+if [ "$DRY_RUN" = true ]; then
+    log "DRY RUN enabled. The following exiftool command will NOT be executed:"
+    echo "
+    exiftool -r -d %s -tagsfromfile \"%d/%F.supplemental-metadata.json\" \\
+        \"-GPSAltitude<GeoDataAltitude\" \\
+        \"-GPSLatitude<GeoDataLatitude\" \"-GPSLatitudeRef<GeoDataLatitude\" \\
+        \"-GPSLongitude<GeoDataLongitude\" \"-GPSLongitudeRef<GeoDataLongitude\" \\
+        \"-Keywords<Tags\" \"-Subject<Tags\" \\
+        \"-Caption-Abstract<Description\" \"-ImageDescription<Description\" \\
+        \"-DateTimeOriginal<PhotoTakenTimeTimestamp\" \\
+        -ext jpg -ext jpeg -ext png -ext heic -ext gif -ext tif -ext tiff \\
+        -ext mp4 -ext mov -ext avi -ext 3gp \\
+        -overwrite_original -progress --ext json \"$TARGET_DIR\"
+    "
+else
+    log "Executing exiftool to write metadata. This may take a while..."
+    log "IMPORTANT: This will overwrite original files. Make sure you have a backup."
+    
+    exiftool -r -d %s -tagsfromfile "%d/%F.supplemental-metadata.json" \
+        "-GPSAltitude<GeoDataAltitude" \
+        "-GPSLatitude<GeoDataLatitude" "-GPSLatitudeRef<GeoDataLatitude" \
+        "-GPSLongitude<GeoDataLongitude" "-GPSLongitudeRef<GeoDataLongitude" \
+        "-Keywords<Tags" "-Subject<Tags" \
+        "-Caption-Abstract<Description" "-ImageDescription<Description" \
+        "-DateTimeOriginal<PhotoTakenTimeTimestamp" \
+        -ext jpg -ext jpeg -ext png -ext heic -ext gif -ext tif -ext tiff \
+        -ext mp4 -ext mov -ext avi -ext 3gp \
+        -overwrite_original -progress --ext json "$TARGET_DIR"
+fi
+
 log "--- Cleanup Complete ---"
