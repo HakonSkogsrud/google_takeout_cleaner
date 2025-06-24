@@ -1,4 +1,4 @@
- #!/bin/bash
+#!/bin/bash
 
 # A script to clean up Google Takeout files by correcting file extensions based on
 # MIME type and ensuring metadata JSON files are named correctly.
@@ -6,6 +6,8 @@
 # --- Configuration ---
 # Set to "true" to run in dry-run mode (print commands without executing them)
 DRY_RUN=false
+# Set to true by default. Can be disabled with --no-mimetype-check flag.
+MIMETYPE_CHECK_ENABLED=true
 
 # Define the log file
 LOG_FILE="google_takeout_cleaner_error.log"
@@ -31,31 +33,64 @@ function error() {
     exit 1
 }
 
+function show_usage() {
+    echo "Usage: $0 [OPTIONS] <target_directory>"
+    echo ""
+    echo "A script to clean up Google Takeout files by correcting file extensions and metadata."
+    echo ""
+    echo "Options:"
+    echo "  --no-mimetype-check    Disables the check for file extensions based on MIME type (Phase 2)."
+    echo "  --dry-run              Print commands without executing them."
+    echo "  -h, --help             Show this help message."
+}
+
 function execute_mv() {
     local source="$1"
     local destination="$2"
 
     if [ "$source" == "$destination" ]; then
-        # No need to move if paths are identical
         return
     fi
 
     if [ "$DRY_RUN" = true ]; then
         echo "  [DRY RUN] mv \"$source\" \"$destination\""
     else
-        # Create destination directory if it doesn't exist (should not be needed with find)
         mkdir -p "$(dirname "$destination")"
-        # Use -v for verbose output
         mv -v "$source" "$destination"
     fi
 }
 
 # --- Argument and Dependency Checks ---
-if [ -z "$1" ]; then
-    error "Usage: $0 <target_directory>"
-fi
+TARGET_DIR=""
+while [[ $# -gt 0 ]]; do
+    key="$1"
+    case $key in
+        --no-mimetype-check)
+            MIMETYPE_CHECK_ENABLED=false
+            shift # past argument
+            ;;
+        --dry-run)
+            DRY_RUN=true
+            shift # past argument
+            ;;
+        -h|--help)
+            show_usage
+            exit 0
+            ;;
+        *)
+            # Assume it's the target directory
+            if [ -n "$TARGET_DIR" ]; then
+                error "Too many arguments. Only one target directory is allowed. Use --help for more info."
+            fi
+            TARGET_DIR="$1"
+            shift # past argument
+            ;;
+    esac
+done
 
-TARGET_DIR="$1"
+if [ -z "$TARGET_DIR" ]; then
+    error "Target directory not specified. Use --help for usage information."
+fi
 
 if [ ! -d "$TARGET_DIR" ]; then
     error "Directory '$TARGET_DIR' not found."
@@ -69,6 +104,11 @@ if [ "$DRY_RUN" = true ]; then
     log "--- SCRIPT IS RUNNING IN DRY-RUN MODE ---"
     log "--- No files will actually be renamed. ---"
 fi
+
+if [ "$MIMETYPE_CHECK_ENABLED" = false ]; then
+    log "--- MIME TYPE CHECK (PHASE 2) IS DISABLED ---"
+fi
+
 
 # ==============================================================================
 # PHASE 1: PRE-CLEANUP JSON FILES
@@ -91,137 +131,189 @@ find "$TARGET_DIR" -type f -name '*).json' -print0 | while IFS= read -r -d $'\0'
     old_name=$(basename "$old_path")
     old_dir=$(dirname "$old_path")
 
-    # Regex to match: {prefix}.{extension}.supplemental-metadata({counter}).json
-    if [[ "$old_name" =~ ^(.+)\.([a-zA-Z0-9]+)\.supplemental-metadata\(([0-9]+)\)\.json$ ]]; then
-        prefix="${BASH_REMATCH[1]}"
-        extension="${BASH_REMATCH[2]}"
-        counter="${BASH_REMATCH[3]}"
+    # This pattern is now simple: just find a counter in parenthesis at the end.
+    if [[ "$old_name" =~ \(([0-9]+)\)\.json$ ]]; then
+        counter="${BASH_REMATCH[1]}"
+        # Strip the counter and .json suffix to get the base with the metadata string
+        # e.g., "img_0002.jpg.supplemental-metadata(123).json" -> "img_0002.jpg.supplemental-metadata"
+        base_with_meta="${old_name%($counter).json}"
 
-        # Construct the correct name: {prefix}({counter}).{extension}.supplemental-metadata.json
-        new_name="${prefix}(${counter}).${extension}.supplemental-metadata.json"
-        new_path="${old_dir}/${new_name}"
+        full_original_filename=""
+        # Now, check for and strip the known metadata strings from the end
+        if [[ "$base_with_meta" == *.supplemental-metadata ]]; then
+            full_original_filename="${base_with_meta%.supplemental-metadata}"
+        elif [[ "$base_with_meta" == *.supplemental-metadat ]]; then
+            full_original_filename="${base_with_meta%.supplemental-metadat}"
+        elif [[ "$base_with_meta" == *.supplemental-meta ]]; then
+            full_original_filename="${base_with_meta%.supplemental-meta}"
+        else
+            # This doesn't match a pattern we know how to fix, so skip it.
+            continue
+        fi
 
-        log "Fixing misplaced parenthesis in JSON filename:"
-        execute_mv "$old_path" "$new_path"
+        # If we successfully isolated the original filename (e.g., "img_0002.jpg")
+        if [ -n "$full_original_filename" ]; then
+            # Now, parse the full_original_filename to separate base and extension
+            base_name="${full_original_filename%.*}"
+            extension="${full_original_filename##*.}"
+
+            # Construct the correct name: {base_name}({counter}).{extension}.supplemental-metadata.json
+            # Note the hardcoded, correct "supplemental-metadata.json" at the end.
+            new_name="${base_name}(${counter}).${extension}.supplemental-metadata.json"
+            new_path="${old_dir}/${new_name}"
+
+            log "Fixing misplaced parenthesis in JSON filename:"
+            execute_mv "$old_path" "$new_path"
+        fi
     fi
 done
 
 
 # ==============================================================================
-# PHASE 2: PROCESS MEDIA FILES AND SYNC METADATA
-# Iterate over all non-JSON files.
+# PHASE 2: CORRECT MEDIA FILE EXTENSIONS BASED ON MIME TYPE
+# This phase focuses solely on renaming the primary media files if needed.
 # ==============================================================================
 
-log "--- Phase 2: Processing media files and syncing metadata ---"
+if [ "$MIMETYPE_CHECK_ENABLED" = true ]; then
+    log "--- Phase 2: Correcting media file extensions (MIME type check enabled) ---"
+    find "$TARGET_DIR" -type f -not -iname '*.json' -print0 | while IFS= read -r -d $'\0' media_path; do
+        
+        dir=$(dirname "$media_path")
+        filename=$(basename "$media_path")
+        log "Processing extension: $media_path"
+
+        # Skip files with .jpg or .jpeg extensions (case-insensitive) for speed.
+        # We assume these are correct and don't need exiftool's MIME type check here.
+        # Their metadata files will be handled in Phase 3.
+        current_ext_lower=$(echo "${filename##*.}" | tr '[:upper:]' '[:lower:]')
+        if [[ "$current_ext_lower" == "jpg" || "$current_ext_lower" == "jpeg" ]]; then
+            log "  - Skipping MIME type check for file with extension '$current_ext_lower': $media_path"
+            continue # Skip to the next media file in this phase
+        fi
+
+        base_name="${filename%.*}"
+
+        # Get the actual MIME type from exiftool
+        mime_type=$(exiftool -s3 -MIMEType "$media_path")
+        new_ext=""
+
+        case "$mime_type" in
+            "image/png")
+                if [[ "$current_ext_lower" != "png" ]]; then new_ext="png"; fi
+                ;;
+            "image/gif")
+                if [[ "$current_ext_lower" != "gif" ]]; then new_ext="gif"; fi
+                ;;
+            "image/heic")
+                if [[ "$current_ext_lower" != "heic" ]]; then new_ext="heic"; fi
+                ;;
+            "video/mp4")
+                if [[ "$current_ext_lower" != "mp4" ]]; then new_ext="mp4"; fi
+                ;;
+            "video/quicktime")
+                if [[ "$current_ext_lower" != "mov" ]]; then new_ext="mov"; fi
+                ;;
+            "image/jpeg")
+                if [[ "$current_ext_lower" != "jpg" && "$current_ext_lower" != "jpeg" ]]; then new_ext="jpg"; fi
+                ;;
+            *)
+                warn "  - Unknown or unhandled MIME type '$mime_type' for '$media_path'. Skipping extension correction."
+                ;;
+        esac
+
+        # If an extension change is needed, rename the file
+        if [ -n "$new_ext" ]; then
+            new_media_path="${dir}/${base_name}.${new_ext}"
+            if [ -e "$new_media_path" ]; then
+                warn "  - SKIPPING rename of '$filename' to '${base_name}.${new_ext}' because destination already exists."
+            else
+                log "  - Correcting extension from '$current_ext_lower' to '$new_ext' based on MIME type '$mime_type'."
+                execute_mv "$media_path" "$new_media_path"
+            fi
+        fi
+    done
+else
+    log "--- Phase 2: SKIPPED (MIME type check was disabled by user) ---"
+fi
+
+
+      
+# ==============================================================================
+# PHASE 3: SYNC METADATA FILENAMES TO MATCH MEDIA FILES
+# This phase ensures that the JSON metadata file is named perfectly to its
+# corresponding media file, including handling the "0" vs "08" discrepancy.
+# ==============================================================================
+
+log "--- Phase 3: Syncing metadata filenames ---"
 find "$TARGET_DIR" -type f -not -iname '*.json' -print0 | while IFS= read -r -d $'\0' media_path; do
     
     dir=$(dirname "$media_path")
     filename=$(basename "$media_path")
-    log "Processing: $media_path"
+    log "Processing metadata for: $media_path"
 
-    # --- Step 2a: Correct media file extension based on MIME type ---
-    current_ext_lower=$(echo "${filename##*.}" | tr '[:upper:]' '[:lower:]')
-    base_name="${filename%.*}"
-
-    # Get the actual MIME type from exiftool
-    mime_type=$(exiftool -s3 -MIMEType "$media_path")
-    new_ext=""
-
-    case "$mime_type" in
-        "image/jpeg")
-            if [[ "$current_ext_lower" != "jpg" && "$current_ext_lower" != "jpeg" ]]; then
-                new_ext="jpg"
-            fi
-            ;;
-        "image/png")
-            if [[ "$current_ext_lower" != "png" ]]; then
-                new_ext="png"
-            fi
-            ;;
-        "image/gif")
-            if [[ "$current_ext_lower" != "gif" ]]; then
-                new_ext="gif"
-            fi
-            ;;
-        "image/heic")
-            if [[ "$current_ext_lower" != "heic" ]]; then
-                new_ext="heic"
-            fi
-            ;;
-        "video/mp4")
-            if [[ "$current_ext_lower" != "mp4" ]]; then
-                new_ext="mp4"
-            fi
-            ;;
-        "video/quicktime")
-            if [[ "$current_ext_lower" != "mov" ]]; then
-                new_ext="mov"
-            fi
-            ;;
-    esac
-
-    # If an extension change is needed, rename the file
-    if [ -n "$new_ext" ]; then
-        new_media_path="${dir}/${base_name}.${new_ext}"
-        if [ -e "$new_media_path" ]; then
-            warn "  - SKIPPING rename of '$filename' to '${base_name}.${new_ext}' because destination already exists."
-        else
-            log "  - Correcting extension from '$current_ext_lower' to '$new_ext' based on MIME type '$mime_type'."
-            execute_mv "$media_path" "$new_media_path"
-            # IMPORTANT: Update our variables to use the new, correct path for the next step
-            media_path="$new_media_path"
-            filename=$(basename "$media_path")
-        fi
-    fi
-
-    # --- Step 2b: Find and rename the corresponding metadata file to match perfectly ---
-    # The expected metadata filename, based on the (now correct) media filename.
     expected_meta_path="${media_path}.supplemental-metadata.json"
 
     if [ -f "$expected_meta_path" ]; then
-        log "  - Metadata file is already correctly named."
-        continue # Move to the next media file
+        log "  - Metadata file is already correctly named for '$filename'."
+        continue
     fi
 
-    # The metadata file is not named correctly. Let's find it.
-    # The pre-cleanup phase should have fixed most issues, so we're likely looking
-    # for a file with a case mismatch or an old extension mismatch.
     base_name_no_ext="${filename%.*}"
-    
-    # Use find to locate potential candidates case-insensitively
-    # We search for any json file that starts with the base name and ends with the metadata suffix.
+
     mapfile -t candidate_files < <(find "$dir" -maxdepth 1 -type f -iname "${base_name_no_ext}.*.supplemental-metadata.json")
     if [ "${#candidate_files[@]}" -eq 1 ]; then
-        # Exactly one candidate found, this is our file.
         found_meta_path="${candidate_files[0]}"
         if [ "$found_meta_path" != "$expected_meta_path" ]; then
-            log "  - Found mismatched metadata file, syncing name:"
+            log "  - Found mismatched metadata file, syncing name for '$filename':"
             execute_mv "$found_meta_path" "$expected_meta_path"
         fi
     elif [ "${#candidate_files[@]}" -gt 1 ]; then
-        # More than one candidate, we can't be sure which one is correct.
         warn "  - Found multiple possible metadata files for '$filename'. Please resolve manually."
         for candidate in "${candidate_files[@]}"; do
             warn "    - Candidate: $candidate"
         done
     else
-        # No metadata file found at all.
-        log "  - No supplemental metadata file found for '$filename'."
+        potential_meta_file="${base_name_no_ext:0:-1}.json"
+        if [ -f "$dir/$potential_meta_file" ]; then
+            log "  - Found metadata file matching old Google Takeout pattern. Renaming for '$filename':"
+            execute_mv "$dir/$potential_meta_file" "$expected_meta_path"
+        else
+            # Check for various supplemental metadata abbreviations
+            potential_meta_file_meta="${media_path}.supplemental-meta.json"
+            potential_meta_file_metadat="${media_path}.supplemental-metadat.json"
+            potential_meta_file_supplem="${media_path}.supplem.json" ### NEW ###
+
+            if [ -f "$potential_meta_file_meta" ]; then
+                log "  - Found 'supplemental-meta.json' file. Renaming for '$filename':"
+                execute_mv "$potential_meta_file_meta" "$expected_meta_path"
+            elif [ -f "$potential_meta_file_metadat" ]; then
+                log "  - Found 'supplemental-metadat.json' file. Renaming for '$filename':"
+                execute_mv "$potential_meta_file_metadat" "$expected_meta_path"
+            elif [ -f "$potential_meta_file_supplem" ]; then ### NEW ###
+                log "  - Found 'supplem.json' file. Renaming for '$filename':" ### NEW ###
+                execute_mv "$potential_meta_file_supplem" "$expected_meta_path" ### NEW ###
+            else
+                log "  - No supplemental metadata file found for '$filename'."
+            fi
+        fi
     fi
 
 done
 
+    
+
+      
 # ==============================================================================
-# PHASE 3: WRITE METADATA FROM JSON TO MEDIA FILES
+# PHASE 4: WRITE METADATA FROM JSON TO MEDIA FILES
 # This is a destructive operation (-overwrite_original).
-# It will only run if DRY_RUN is set to false.
 # ==============================================================================
-log "--- Phase 3: Writing metadata from JSON files into media files ---"
+log "--- Phase 4: Writing metadata from JSON files into media files ---"
 
 if [ "$DRY_RUN" = true ]; then
     log "DRY RUN enabled. The following exiftool command will NOT be executed:"
     echo "
     exiftool -r -d %s -tagsfromfile \"%d/%F.supplemental-metadata.json\" \\
+        -exclude \"*edited*\" \\
         \"-GPSAltitude<GeoDataAltitude\" \\
         \"-GPSLatitude<GeoDataLatitude\" \"-GPSLatitudeRef<GeoDataLatitude\" \\
         \"-GPSLongitude<GeoDataLongitude\" \"-GPSLongitudeRef<GeoDataLongitude\" \\
@@ -237,6 +329,7 @@ else
     log "IMPORTANT: This will overwrite original files. Make sure you have a backup."
     
     exiftool -r -d %s -tagsfromfile "%d/%F.supplemental-metadata.json" \
+        -exclude "*edited*" \
         "-GPSAltitude<GeoDataAltitude" \
         "-GPSLatitude<GeoDataLatitude" "-GPSLatitudeRef<GeoDataLatitude" \
         "-GPSLongitude<GeoDataLongitude" "-GPSLongitudeRef<GeoDataLongitude" \
@@ -249,3 +342,5 @@ else
 fi
 
 log "--- Cleanup Complete ---"
+
+    

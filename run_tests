@@ -1,0 +1,4 @@
+rm -rf test_files
+rm google_takeout_cleaner_error.log
+tar -xvzf test_files.tar.gz
+./google_takeout_cleaner test_files
